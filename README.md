@@ -1,0 +1,164 @@
+# NATS Atomic Publisher
+
+**Concurrent Rust publication into one JetStream stream, with automatic atomic batching, conflict isolation, and bounded queues.**
+
+Submit related messages as one indivisible operation. The publisher can combine independent operations into a larger server batch, return a receipt to each caller, and isolate stale subject comparisons after a definite rejection.
+
+NATS supplies atomicity. This library supplies the coordination around it.
+
+> Development version: local repository, not published to crates.io. API stability is not promised before a reviewed release. Rust 1.88+, Tokio, async-nats 0.50; the wire protocol requires NATS 2.12+ with atomic publishing enabled. Match client limits to your server configuration.
+
+## Why this exists
+
+Suppose 100 workflow updates arrive together. Each contains a state change and an event that must land together. Combining their writes saves transactions, but one stale optimistic-concurrency comparison can reject the whole batch.
+
+The publisher inspects subject sequences after that definite rejection, reports stale operations as conflicts, and submits the remaining candidates again. Their comparisons remain attached: the server checks them again at commit. A read during isolation never grants permission to overwrite newer state.
+
+This is useful for workflow journals, task schedulers, state machines, and other applications with independent, conditional multi-message writes into one stream.
+
+## Features
+
+- Indivisible submissions, even when combined with other callers.
+- Configurable batching window, message/byte limits, queue sizes, and in-flight concurrency.
+- Separate ordinary and priority byte budgets.
+- Conflict isolation with bounded, timed subject-sequence reads.
+- Per-submission first/final stream sequences.
+- Explicit pre-admission versus uncertain-outcome errors.
+- Existing async-nats connections: keep your authentication, TLS, and reconnect configuration.
+- An injectable `Backend` for capacity policies, testing, and transport integration.
+
+## Quick start
+
+Use a path dependency while developing locally:
+
+```toml
+[dependencies]
+nats-atomic-publisher = { path = "../nats-atomic-publisher" }
+async-nats = "0.50"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust,no_run
+use nats_atomic_publisher::{
+    AtomicPublisher, CancellationToken, Config, NatsBackend, Publication,
+};
+use std::{sync::Arc, time::Duration};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let client = async_nats::connect("nats://127.0.0.1:4222").await?;
+let js = async_nats::jetstream::new(client.clone());
+js.create_stream(async_nats::jetstream::stream::Config {
+    name: "WORKFLOWS".into(),
+    subjects: vec!["workflows.>".into()],
+    allow_atomic_publish: true,
+    allow_direct: true, // required for conflict inspection
+    ..Default::default()
+}).await?;
+
+let shutdown = CancellationToken::new();
+let publisher = AtomicPublisher::new(
+    Arc::new(NatsBackend::new(client, Duration::from_secs(3))?),
+    "WORKFLOWS",
+    Config::default(),
+    shutdown.clone(),
+)?;
+let receipt = publisher.publish(
+    vec![
+        Publication::new("workflows.job42.state", "running")
+            .expected_subject_sequence(0),
+        Publication::new("workflows.job42.events", "started"),
+    ],
+    &CancellationToken::new(),
+).await?;
+println!("Stored sequences {}..={}", receipt.first_sequence, receipt.last_sequence);
+shutdown.cancel();
+Ok(())
+}
+```
+
+The expected sequence is a **stream sequence on that subject**, not a per-subject message count. Zero means the subject has no previous message.
+
+| Example | Command | Demonstrates |
+| --- | --- | --- |
+| [Basic](examples/basic.rs) | `cargo run --example basic` | Stream setup and an acknowledged submission |
+| [Conflict isolation](examples/conflict_isolation.rs) | `cargo run --example conflict_isolation` | A stale submission alongside an independent write |
+| [Admission policy](examples/admission_policy.rs) | `cargo run --example admission_policy` | Ordinary traffic gated while priority completion proceeds |
+
+The runnable [basic example](examples/basic.rs) creates a uniquely named stream and deletes it after the demonstration:
+
+```sh
+docker run -d --name atomic-demo -p 127.0.0.1:4222:4222 nats:2.12.1 -js
+NATS_URL=nats://127.0.0.1:4222 cargo run --example basic
+docker rm -f atomic-demo
+```
+
+## Configuration
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `queue_capacity` | 2048 | Queued ordinary submissions |
+| `priority_queue_capacity` | 256 | Queued priority submissions |
+| `queue_bytes` | 64 MiB | Estimated ordinary bytes queued/in flight |
+| `priority_queue_bytes` | 8 MiB | Independent priority byte allowance |
+| `max_batch_messages` | 1000 | Maximum messages per combined batch |
+| `max_batch_bytes` | 4 MiB | Maximum estimated bytes per batch/submission |
+| `max_in_flight` | 2 | Concurrent write/isolation tasks per publisher |
+| `batch_window` | 1 ms | Maximum collection delay |
+| `request_timeout` | 5 s | Caller deadline and backend-operation deadline |
+| `inspection_timeout` | 1 s | Whole conflict-inspection deadline |
+| `inspection_concurrency` | 16 | Concurrent submission inspections |
+
+Byte accounting includes payload, subject, headers, and a conservative per-message allowance. It bounds retained publication estimates; it does not measure allocator overhead or cap callers' own allocations before admission. Configure all publisher instances together against stream/server limits.
+
+Overlapping subject writes are not combined. Global stream-sequence comparisons and alternate-subject comparisons are kept in separate batches. Batches may commit out of submission order when `max_in_flight > 1`; use subject comparisons to enforce application ordering. No ordering guarantee is made across processes.
+
+## Priority and capacity
+
+`publish_priority` uses a separate local queue and byte allowance. It is scheduled ahead of ordinary work when a slot opens, and bypasses `Backend::admit`. Use it for small settlement or recovery records that should remain admissible when ordinary traffic saturates the local queue.
+
+This does **not** reserve server disk, preempt a running batch, or guarantee fairness. Sustained priority traffic can starve ordinary work. A custom backend may enforce an ordinary-write high-water policy while leaving server capacity for completion records. Capacity observations are advisory; the server remains responsible for storage limits.
+
+See [adaptation examples](docs/adapting.md) for policy hooks and integration boundaries.
+
+## Error and retry contract
+
+| Error | Meaning | Caller action |
+| --- | --- | --- |
+| `Invalid` | Invalid input/configuration; never admitted | Fix the input |
+| `Closed` | Publisher closed before admission | Use a live publisher |
+| `NotAdmitted` | Cancelled/timed out before queue admission | Safe to resubmit |
+| `Conflict` | Definite server comparison rejection | Read current state; form a new operation |
+| `Rejected` | Definite server rejection | Resolve capacity/configuration/unsupported operation |
+| `Unavailable` | Setup failed before commit, admission policy failed, or inspection failed | Diagnose and retry according to application policy |
+| `Indeterminate` | Commit may have happened | Reconcile before retrying |
+| `InvalidReceipt` | Receipt cannot prove the expected commit | Reconcile before retrying |
+
+Only `Conflict` triggers automatic isolation, and only when an actual stale subject comparison is found. Other rejections and uncertain results never trigger automatic replay.
+
+**Timeout/cancellation after admission is uncertain.** It does not retract a publication. Include stable operation identities in your application records, then read them back to decide whether the intended operation committed. This library does not implement application reconciliation or make an exactly-once claim.
+
+Dropping all publisher handles drains admitted work. Cancelling the shared shutdown token aborts the pump; admitted writes become uncertain. This version has no explicit graceful-shutdown join API: applications needing a drain barrier should await their publication futures before shutdown.
+
+## Boundaries
+
+The server supplies the atomic batch protocol. This package coordinates concurrent submissions, coalescing, per-caller receipts, local priority budgets, and subject-comparison conflict isolation. It does not provide cross-stream transactions, consumer-side atomic delivery, or a workflow engine.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+```
+
+Unit tests use injected backends and require no broker. The real-server test is explicitly ignored in the default suite:
+
+```sh
+NATS_URL=nats://127.0.0.1:4222 cargo test --test nats -- --ignored
+```
+
+Use a dedicated test server. The test creates and deletes only its uniquely named stream. It checks receipts, conflict isolation, and rejection of an entire indivisible submission. CI runs both suites. No throughput claim is made without a recorded benchmark.
+
+Read [the design](docs/design.md), [contributor instructions](AGENTS.md), and [release preparation](RELEASE.md).
