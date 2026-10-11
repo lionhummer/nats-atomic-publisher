@@ -29,11 +29,11 @@ This is useful for workflow journals, task schedulers, state machines, and other
 
 ## Quick start
 
-Install the tagged GitHub release (crates.io publication is pending):
+Install from crates.io:
 
 ```toml
 [dependencies]
-nats-atomic-publisher = { git = "https://github.com/lionhummer/nats-atomic-publisher", tag = "v0.1.0" }
+nats-atomic-publisher = "0.1"
 async-nats = "0.50"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
