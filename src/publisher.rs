@@ -60,6 +60,13 @@ impl Config {
             || self.priority_queue_bytes > Semaphore::MAX_PERMITS
             || self.request_timeout.is_zero()
             || self.inspection_timeout.is_zero()
+            || [
+                self.request_timeout,
+                self.inspection_timeout,
+                self.batch_window,
+            ]
+            .iter()
+            .any(|d| tokio::time::Instant::now().checked_add(*d).is_none())
         {
             return Err(Error::Invalid);
         }
@@ -74,6 +81,7 @@ pub struct AtomicPublisher {
     priority_budget: Arc<Semaphore>,
     config: Arc<Config>,
     shutdown: CancellationToken,
+    stream: String,
 }
 struct Pending {
     messages: Vec<Publication>,
@@ -92,7 +100,7 @@ impl AtomicPublisher {
     ) -> Result<Self, Error> {
         config.validate()?;
         let stream = stream.into();
-        if stream.is_empty() || stream.contains([' ', '.', '*', '>']) {
+        if !crate::valid_stream(&stream) {
             return Err(Error::Invalid);
         }
         let handle = tokio::runtime::Handle::try_current().map_err(|_| Error::Invalid)?;
@@ -101,7 +109,7 @@ impl AtomicPublisher {
         let config = Arc::new(config);
         handle.spawn(run(
             backend,
-            stream,
+            stream.clone(),
             config.clone(),
             ordinary_rx,
             priority_rx,
@@ -114,6 +122,7 @@ impl AtomicPublisher {
             priority_budget: Arc::new(Semaphore::new(config.priority_queue_bytes)),
             config,
             shutdown,
+            stream,
         })
     }
     /// Publish an indivisible ordinary submission.
@@ -142,26 +151,7 @@ impl AtomicPublisher {
         if messages.is_empty() || messages.len() > self.config.max_batch_messages {
             return Err(Error::Invalid);
         }
-        for m in &messages {
-            if m.subject.is_empty()
-                || m.subject
-                    .split('.')
-                    .any(|s| s.is_empty() || s.contains([' ', '\t', '\r', '\n', '*', '>']))
-            {
-                return Err(Error::Invalid);
-            }
-            for name in ["Nats-Batch-Id", "Nats-Batch-Sequence", "Nats-Batch-Commit"] {
-                if m.headers.get(name).is_some() {
-                    return Err(Error::Invalid);
-                }
-            }
-            if let Some(expected) = m.headers.get("Nats-Expected-Last-Subject-Sequence") {
-                expected
-                    .as_str()
-                    .parse::<u64>()
-                    .map_err(|_| Error::Invalid)?;
-            }
-        }
+        crate::validate_messages(&self.stream, &messages)?;
         let bytes = messages
             .iter()
             .try_fold(0usize, |n, m| n.checked_add(m.bytes()?))
@@ -365,7 +355,9 @@ async fn execute(
                 };
                 // Re-submit only after identifying at least one actual conflict.
                 if !results.contains(&Err(Error::Conflict)) {
-                    fail(group, Error::Conflict);
+                    for (p, result) in group.into_iter().zip(results) {
+                        let _ = p.reply.send(Err(result.err().unwrap_or(Error::Conflict)));
+                    }
                     return;
                 }
                 group = group

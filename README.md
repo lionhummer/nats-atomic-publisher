@@ -6,7 +6,7 @@ Submit related messages as one indivisible operation. The publisher can combine 
 
 NATS supplies atomicity. This library supplies the coordination around it.
 
-> Development version: private development repository, not published to crates.io. API stability is not promised before a reviewed release. Rust 1.88+, Tokio, async-nats 0.50; the wire protocol requires NATS 2.12+ with atomic publishing enabled. Match client limits to your server configuration.
+> Version 0.1.0. Rust 1.88+, Tokio with its time driver enabled, async-nats 0.50. Tested against NATS 2.12.1 and 2.15.0 with atomic publishing enabled. Match client limits to your server configuration. Distributed under MIT OR Apache-2.0.
 
 ## Why this exists
 
@@ -29,11 +29,11 @@ This is useful for workflow journals, task schedulers, state machines, and other
 
 ## Quick start
 
-Use a path dependency while developing locally:
+Install the tagged GitHub release (crates.io publication is pending):
 
 ```toml
 [dependencies]
-nats-atomic-publisher = { path = "../nats-atomic-publisher" }
+nats-atomic-publisher = { git = "https://github.com/lionhummer/nats-atomic-publisher", tag = "v0.1.0" }
 async-nats = "0.50"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -111,7 +111,7 @@ docker rm -f atomic-demo
 
 Byte accounting includes payload, subject, headers, and a conservative per-message allowance. It bounds retained publication estimates; it does not measure allocator overhead or cap callers' own allocations before admission. Configure all publisher instances together against stream/server limits.
 
-Overlapping subject writes are not combined. Global stream-sequence comparisons and alternate-subject comparisons are kept in separate batches. Batches may commit out of submission order when `max_in_flight > 1`; use subject comparisons to enforce application ordering. No ordering guarantee is made across processes.
+Overlapping subject writes are not combined. Global stream-sequence comparisons and alternate-subject comparisons are kept in separate batches. A global sequence comparison may appear only on the first message. A later write to an already-written subject cannot carry another subject-sequence comparison. Mismatched expected streams, duplicate comparison headers, and reserved batch headers are rejected before admission. Batches may commit out of submission order when `max_in_flight > 1`; use subject comparisons to enforce application ordering. No ordering guarantee is made across processes.
 
 ## Priority and capacity
 
@@ -134,7 +134,7 @@ See [adaptation examples](docs/adapting.md) for policy hooks and integration bou
 | `Indeterminate` | Commit may have happened | Reconcile before retrying |
 | `InvalidReceipt` | Receipt cannot prove the expected commit | Reconcile before retrying |
 
-Only `Conflict` triggers automatic isolation, and only when an actual stale subject comparison is found. Other rejections and uncertain results never trigger automatic replay.
+Only `Conflict` triggers automatic isolation, and only when an actual stale subject comparison is found. Other rejections and uncertain results never trigger automatic replay. Subject-read failures remain `Unavailable`, even if isolation cannot identify a stale comparison.
 
 **Timeout/cancellation after admission is uncertain.** It does not retract a publication. Include stable operation identities in your application records, then read them back to decide whether the intended operation committed. This library does not implement application reconciliation or make an exactly-once claim.
 
@@ -159,6 +159,8 @@ Unit tests use injected backends and require no broker. The real-server test is 
 NATS_URL=nats://127.0.0.1:4222 cargo test --test nats -- --ignored
 ```
 
-Use a dedicated test server. The test creates and deletes only its uniquely named stream. It checks receipts, conflict isolation, and rejection of an entire indivisible submission. CI runs both suites. No throughput claim is made without a recorded benchmark.
+Use a dedicated test server. The test creates and deletes only its uniquely named stream. The five broker tests check real concurrent receipt ranges, comparison contention, whole-submission rejection, capacity/feature rejection, committed writes with withheld receipts, and malformed wire acknowledgments. CI runs both suites on the minimum supported and stable Rust toolchains against NATS 2.12.1 and 2.15.0. No throughput claim is made without a recorded benchmark.
+
+The protocol follows [NATS ADR-50](https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-50.md). `Nats-Expected-Last-Msg-Id` is unsupported by atomic batches; the server rejects it. `Nats-Msg-Id` deduplication is supported from NATS 2.12.1, but a duplicate rejects the entire combined batch.
 
 Read [the design](docs/design.md), [contributor instructions](AGENTS.md), and [release preparation](RELEASE.md).

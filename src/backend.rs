@@ -25,7 +25,7 @@ pub struct NatsBackend {
 }
 impl NatsBackend {
     pub fn new(client: async_nats::Client, timeout: Duration) -> Result<Self, Error> {
-        if timeout.is_zero() {
+        if timeout.is_zero() || tokio::time::Instant::now().checked_add(timeout).is_none() {
             return Err(Error::Invalid);
         }
         Ok(Self {
@@ -62,9 +62,7 @@ fn rejection(payload: &[u8]) -> Option<Error> {
 #[async_trait]
 impl Backend for NatsBackend {
     async fn atomic(&self, stream: &str, messages: Vec<Publication>) -> Result<u64, Error> {
-        if messages.is_empty() {
-            return Err(Error::Invalid);
-        }
+        crate::validate_messages(stream, &messages)?;
         let count = messages.len();
         let batch = uuid::Uuid::now_v7().to_string();
         let send = async {

@@ -82,3 +82,62 @@ impl Error {
         matches!(self, Self::Indeterminate | Self::InvalidReceipt)
     }
 }
+
+// Shared by queued and direct transports: reject ambiguous comparisons before IO.
+pub(crate) fn valid_stream(stream: &str) -> bool {
+    !stream.is_empty()
+        && !stream
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || ".*>/\\".contains(c))
+}
+pub(crate) fn validate_messages(stream: &str, messages: &[Publication]) -> Result<(), Error> {
+    if !valid_stream(stream) || messages.is_empty() {
+        return Err(Error::Invalid);
+    }
+    let mut subjects = std::collections::HashSet::new();
+    for (index, m) in messages.iter().enumerate() {
+        if m.subject.split('.').any(|s| {
+            s.is_empty()
+                || s.chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || "*>".contains(c))
+        }) {
+            return Err(Error::Invalid);
+        }
+        for h in ["Nats-Batch-Id", "Nats-Batch-Sequence", "Nats-Batch-Commit"] {
+            if m.headers.get(h).is_some() {
+                return Err(Error::Invalid);
+            }
+        }
+        for h in [
+            "Nats-Expected-Last-Subject-Sequence",
+            "Nats-Expected-Last-Sequence",
+            "Nats-Expected-Stream",
+            "Nats-Expected-Last-Subject-Sequence-Subject",
+        ] {
+            if m.headers.get_all(h).count() > 1 {
+                return Err(Error::Invalid);
+            }
+        }
+        for h in [
+            "Nats-Expected-Last-Subject-Sequence",
+            "Nats-Expected-Last-Sequence",
+        ] {
+            if let Some(value) = m.headers.get(h) {
+                value.as_str().parse::<u64>().map_err(|_| Error::Invalid)?;
+            }
+        }
+        if m.headers
+            .get("Nats-Expected-Stream")
+            .is_some_and(|v| v.as_str() != stream)
+            || (index > 0 && m.headers.get("Nats-Expected-Last-Sequence").is_some())
+            || (subjects.contains(&m.subject)
+                && m.headers
+                    .get("Nats-Expected-Last-Subject-Sequence")
+                    .is_some())
+        {
+            return Err(Error::Invalid);
+        }
+        subjects.insert(&m.subject);
+    }
+    Ok(())
+}
