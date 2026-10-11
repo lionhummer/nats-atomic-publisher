@@ -36,10 +36,13 @@ impl Backend for Fake {
             return Ok(0);
         }
         for m in &messages {
-            if let Some(e) = m.headers.get("Nats-Expected-Last-Subject-Sequence") {
-                if e.as_str().parse::<u64>().unwrap() != *s.subjects.get(&m.subject).unwrap_or(&0) {
-                    return Err(Error::Conflict);
-                }
+            if m.headers
+                .get("Nats-Expected-Last-Subject-Sequence")
+                .is_some_and(|e| {
+                    e.as_str().parse::<u64>().unwrap() != *s.subjects.get(&m.subject).unwrap_or(&0)
+                })
+            {
+                return Err(Error::Conflict);
             }
         }
         for m in messages {
