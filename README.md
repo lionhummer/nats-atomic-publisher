@@ -6,7 +6,7 @@ Submit related messages as one indivisible operation. The publisher can combine 
 
 NATS supplies atomicity. This library supplies the coordination around it.
 
-> Development version: local repository, not published to crates.io. API stability is not promised before a reviewed release. Rust 1.88+, Tokio, async-nats 0.50; the wire protocol requires NATS 2.12+ with atomic publishing enabled. Match client limits to your server configuration.
+> Development version: private development repository, not published to crates.io. API stability is not promised before a reviewed release. Rust 1.88+, Tokio, async-nats 0.50; the wire protocol requires NATS 2.12+ with atomic publishing enabled. Match client limits to your server configuration.
 
 ## Why this exists
 

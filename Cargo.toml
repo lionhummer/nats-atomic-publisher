@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Concurrent atomic JetStream publication with bounded queues and conflict isolation"
+repository = "https://github.com/lionhummer/nats-atomic-publisher"
+readme = "README.md"
 publish = false
 
 [dependencies]
