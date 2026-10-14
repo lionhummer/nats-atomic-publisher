@@ -174,7 +174,7 @@ Unit tests use injected backends and require no broker. The real-server test is 
 NATS_URL=nats://127.0.0.1:4222 cargo test --test nats -- --ignored
 ```
 
-Use a dedicated test server. The test creates and deletes only its uniquely named stream. The five broker tests check real concurrent receipt ranges, comparison contention, whole-submission rejection, capacity/feature rejection, committed writes with withheld receipts, and malformed wire acknowledgments. CI runs both suites on the minimum supported and stable Rust toolchains against NATS 2.12.1 and 2.15.0. No throughput claim is made without a recorded benchmark.
+Use a dedicated test server. The test creates and deletes only its uniquely named stream. The six broker tests check real concurrent receipt ranges, comparison contention, whole-submission rejection, capacity/feature rejection, committed writes with withheld receipts, malformed wire acknowledgments, priority batching, and cancellation before transmission. CI runs both suites on the minimum supported and stable Rust toolchains against NATS 2.12.1 and 2.15.0. No throughput claim is made without a recorded benchmark.
 
 The protocol follows [NATS ADR-50](https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-50.md). `Nats-Expected-Last-Msg-Id` is unsupported by atomic batches; the server rejects it. `Nats-Msg-Id` deduplication is supported from NATS 2.12.1, but a duplicate rejects the entire combined batch.
 

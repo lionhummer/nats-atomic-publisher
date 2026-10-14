@@ -1,6 +1,6 @@
-# 0.1.0 verification
+# 0.2.0 verification
 
-The release suite contains 18 injected-backend regression tests, five explicitly enabled dedicated-broker tests, and one compiled README example. Three executable examples provision and delete their own uniquely named streams.
+The release suite contains 28 injected-backend regression tests, six explicitly enabled dedicated-broker tests, and one compiled README example. Three executable examples provision and delete their own uniquely named streams.
 
 ## What is checked
 
@@ -8,12 +8,16 @@ The release suite contains 18 injected-backend regression tests, five explicitly
 - 100 concurrent two-message submissions with complete, unique sequence coverage.
 - Stale-group isolation and a concurrent change between subject inspection and retry.
 - Failed and timed-out inspection without replay.
-- Cancellation before admission, while waiting for bytes, and after transport starts.
+- Cancellation before admission, while waiting for bytes, behind an active transport, during capacity checks, during conflict inspection, and after transport starts.
+- Dropped futures, queued deadlines and capacity-hook deadlines cannot produce later writes.
+- Conflict reads do not occupy publication slots; an independent inspection bound is respected.
+- Priority batches return individual receipt ranges and retain policy bypass on retry.
 - Budget recovery, ordinary saturation, priority scheduling, and priority policy bypass.
 - Indeterminate/invalid receipts without automatic retries.
 - Invalid headers, subjects, stream expectations, comparison shape, and extreme timer values.
 - On real JetStream: 128 concurrent three-message submissions with stored subject/payload verification, then 32 competing comparisons with exactly one success.
 - Real whole-submission rejection on a stale comparison, capacity rejection, and disabled atomic publishing.
+- Real priority coalescing and cancellation during a blocked admission check, with stored-message verification and separate read/write connections.
 - A real committed write with its receipt withheld: uncertain result, exactly one stored write, and no replay.
 - A NATS responder fixture with wrong stream/batch/count/sequence, malformed JSON, missing replies, definite rejections, conflicts, and a valid receipt.
 
