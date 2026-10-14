@@ -20,9 +20,14 @@ async fn real_atomicity_conflicts_and_receipts() {
     })
     .await
     .unwrap();
+    let inspection_client = async_nats::connect(std::env::var("NATS_URL").unwrap())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let p = AtomicPublisher::new(
-        Arc::new(NatsBackend::new(client, Duration::from_secs(3)).unwrap()),
+        Arc::new(
+            NatsBackend::with_clients(client, inspection_client, Duration::from_secs(3)).unwrap(),
+        ),
         &name,
         Config {
             batch_window: Duration::from_millis(20),
@@ -358,4 +363,110 @@ async fn wire_receipt_validation_and_missing_acknowledgments() {
     let mut bad = Publication::new("invalid", "x");
     bad.headers.insert("Nats-Batch-Commit", "1");
     assert_eq!(backend.atomic("TEST", vec![bad]).await, Err(Error::Invalid));
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated NATS server"]
+async fn priority_batches_and_cancelled_policy_waits_on_real_server() {
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    struct Gated {
+        inner: NatsBackend,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        batches: Mutex<Vec<usize>>,
+    }
+    #[async_trait]
+    impl Backend for Gated {
+        async fn admit(&self, _: &[Publication]) -> Result<(), Error> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn atomic(&self, s: &str, m: Vec<Publication>) -> Result<u64, Error> {
+            self.batches.lock().unwrap().push(m.len());
+            self.inner.atomic(s, m).await
+        }
+        async fn last_subject_sequence(&self, s: &str, t: &str) -> Result<u64, Error> {
+            self.inner.last_subject_sequence(s, t).await
+        }
+    }
+    let (client, js, name) = setup(true, -1).await;
+    let reads = async_nats::connect(std::env::var("NATS_URL").unwrap())
+        .await
+        .unwrap();
+    let backend = Arc::new(Gated {
+        inner: NatsBackend::with_clients(client, reads, Duration::from_secs(3)).unwrap(),
+        entered: Default::default(),
+        release: Default::default(),
+        batches: Default::default(),
+    });
+    let shutdown = CancellationToken::new();
+    let p = AtomicPublisher::new(
+        backend.clone(),
+        &name,
+        Config {
+            batch_window: Duration::from_millis(20),
+            max_in_flight: 1,
+            ..Default::default()
+        },
+        shutdown.clone(),
+    )
+    .unwrap();
+    let c = CancellationToken::new();
+    let (a, b) = tokio::join!(
+        p.publish_priority(vec![Publication::new(format!("{name}.a"), "a")], &c),
+        p.publish_priority(vec![Publication::new(format!("{name}.b"), "b")], &c),
+    );
+    assert_eq!(a.unwrap().first_sequence, 1);
+    assert_eq!(b.unwrap().last_sequence, 2);
+    assert_eq!(*backend.batches.lock().unwrap(), [2]);
+    let task = tokio::spawn({
+        let p = p.clone();
+        let name = name.clone();
+        let c = c.clone();
+        async move {
+            p.publish(
+                vec![Publication::new(
+                    format!("{name}.cancelled"),
+                    "must-not-land",
+                )],
+                &c,
+            )
+            .await
+        }
+    });
+    backend.entered.notified().await;
+    c.cancel();
+    assert_eq!(task.await.unwrap(), Err(Error::NotPublished));
+    backend.release.notify_one();
+    assert_eq!(
+        p.publish_priority(
+            vec![Publication::new(format!("{name}.barrier"), "done")],
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .last_sequence,
+        3
+    );
+    assert_eq!(
+        backend
+            .inner
+            .last_subject_sequence(&name, &format!("{name}.cancelled"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        js.get_stream(&name)
+            .await
+            .unwrap()
+            .cached_info()
+            .state
+            .messages,
+        3
+    );
+    shutdown.cancel();
+    js.delete_stream(name).await.unwrap();
 }

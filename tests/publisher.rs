@@ -215,12 +215,13 @@ impl Backend for Slow {
     }
 }
 #[tokio::test]
-async fn timeout_after_admission_is_uncertain() {
+async fn timeout_after_transmission_starts_is_uncertain() {
     let p = AtomicPublisher::new(
         Arc::new(Slow),
         "TEST",
         Config {
             request_timeout: Duration::from_millis(10),
+            batch_window: Duration::ZERO,
             ..config()
         },
         CancellationToken::new(),
@@ -301,6 +302,10 @@ async fn priority_has_separate_budget_when_ordinary_is_saturated() {
 async fn rejects_extreme_durations_and_ambiguous_inputs_without_io() {
     let fake = Arc::new(Fake::default());
     for cfg in [
+        Config {
+            max_inspections: 0,
+            ..config()
+        },
         Config {
             request_timeout: Duration::MAX,
             ..config()
@@ -638,4 +643,410 @@ async fn priority_bypasses_policy_while_ordinary_rejection_has_no_effect() {
         backend.fake.state.lock().unwrap().calls,
         vec![vec!["priority"]]
     );
+}
+
+#[tokio::test]
+async fn priority_submissions_coalesce_with_correct_receipt_ranges() {
+    let fake = Arc::new(Fake::default());
+    let p = publisher(fake.clone(), config());
+    let c = CancellationToken::new();
+    let (a, b) = tokio::join!(
+        p.publish_priority(
+            vec![Publication::new("a", "1"), Publication::new("b", "2")],
+            &c
+        ),
+        p.publish_priority(vec![Publication::new("c", "3")], &c),
+    );
+    assert_eq!(
+        (a.unwrap().first_sequence, b.unwrap().last_sequence),
+        (1, 3)
+    );
+    assert_eq!(fake.state.lock().unwrap().calls.len(), 1);
+}
+
+struct AdmissionGate {
+    fake: Fake,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait]
+impl Backend for AdmissionGate {
+    async fn admit(&self, _: &[Publication]) -> Result<(), Error> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+    async fn atomic(&self, s: &str, m: Vec<Publication>) -> Result<u64, Error> {
+        self.fake.atomic(s, m).await
+    }
+    async fn last_subject_sequence(&self, s: &str, t: &str) -> Result<u64, Error> {
+        self.fake.last_subject_sequence(s, t).await
+    }
+}
+fn admission_gate() -> Arc<AdmissionGate> {
+    Arc::new(AdmissionGate {
+        fake: Fake::default(),
+        entered: Default::default(),
+        release: Default::default(),
+    })
+}
+
+#[tokio::test]
+async fn cancellation_during_policy_wait_never_transmits_and_recovers_budget() {
+    let g = admission_gate();
+    let p = AtomicPublisher::new(
+        g.clone(),
+        "TEST",
+        Config {
+            queue_bytes: 514,
+            batch_window: Duration::ZERO,
+            ..config()
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let c = CancellationToken::new();
+    let task = tokio::spawn({
+        let p = p.clone();
+        let c = c.clone();
+        async move { p.publish(vec![Publication::new("a", "1")], &c).await }
+    });
+    g.entered.notified().await;
+    c.cancel();
+    assert_eq!(task.await.unwrap(), Err(Error::NotPublished));
+    g.release.notify_one();
+    let next = tokio::spawn({
+        let p = p.clone();
+        async move {
+            p.publish(vec![Publication::new("b", "1")], &CancellationToken::new())
+                .await
+        }
+    });
+    g.entered.notified().await;
+    g.release.notify_one();
+    assert_eq!(next.await.unwrap().unwrap().last_sequence, 1);
+    assert_eq!(g.fake.state.lock().unwrap().calls, vec![vec!["b"]]);
+}
+
+#[tokio::test]
+async fn dropping_queued_future_does_not_publish_its_messages() {
+    let g = admission_gate();
+    let p = AtomicPublisher::new(g.clone(), "TEST", config(), CancellationToken::new()).unwrap();
+    let task = tokio::spawn({
+        let p = p.clone();
+        async move {
+            p.publish(vec![Publication::new("a", "1")], &CancellationToken::new())
+                .await
+        }
+    });
+    g.entered.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    g.release.notify_one();
+    let receipt = p
+        .publish_priority(
+            vec![Publication::new("barrier", "1")],
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.last_sequence, 1);
+    assert_eq!(g.fake.state.lock().unwrap().calls, vec![vec!["barrier"]]);
+}
+
+#[tokio::test]
+async fn expired_deadline_in_batch_window_never_transmits() {
+    let fake = Arc::new(Fake::default());
+    let p = publisher(
+        fake.clone(),
+        Config {
+            batch_window: Duration::from_millis(50),
+            ..config()
+        },
+    );
+    let c = CancellationToken::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let (expired, live) = tokio::join!(
+        p.publish_until(vec![Publication::new("expired", "1")], deadline, &c),
+        p.publish(vec![Publication::new("live", "1")], &c),
+    );
+    assert_eq!(expired, Err(Error::NotPublished));
+    assert_eq!(live.unwrap().first_sequence, 1);
+    assert_eq!(fake.state.lock().unwrap().calls, vec![vec!["live"]]);
+    assert_eq!(
+        p.publish_until(
+            vec![Publication::new("past", "1")],
+            tokio::time::Instant::now(),
+            &c
+        )
+        .await,
+        Err(Error::NotAdmitted)
+    );
+}
+
+#[tokio::test]
+async fn backend_policy_timeout_is_definite_nonpublication() {
+    let g = admission_gate();
+    let p = AtomicPublisher::new(
+        g.clone(),
+        "TEST",
+        Config {
+            request_timeout: Duration::from_millis(10),
+            batch_window: Duration::ZERO,
+            ..config()
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        p.publish_until(
+            vec![Publication::new("a", "1")],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new()
+        )
+        .await,
+        Err(Error::NotPublished)
+    );
+    assert!(g.fake.state.lock().unwrap().calls.is_empty());
+}
+
+struct BlockedInspection {
+    fake: Fake,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl Backend for BlockedInspection {
+    async fn atomic(&self, s: &str, m: Vec<Publication>) -> Result<u64, Error> {
+        self.fake.atomic(s, m).await
+    }
+    async fn last_subject_sequence(&self, s: &str, t: &str) -> Result<u64, Error> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let n = self.active.fetch_add(1, SeqCst) + 1;
+        self.peak.fetch_max(n, SeqCst);
+        self.entered.notify_one();
+        self.release.acquire().await.unwrap().forget();
+        self.active.fetch_sub(1, SeqCst);
+        self.fake.last_subject_sequence(s, t).await
+    }
+}
+#[tokio::test]
+async fn inspection_does_not_block_writes_and_has_an_independent_bound() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let g = Arc::new(BlockedInspection {
+        fake: Fake::default(),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        active: Default::default(),
+        peak: Default::default(),
+    });
+    for i in 0..3 {
+        g.fake
+            .state
+            .lock()
+            .unwrap()
+            .subjects
+            .insert(format!("stale{i}"), 99);
+    }
+    let p = AtomicPublisher::new(
+        g.clone(),
+        "TEST",
+        Config {
+            max_batch_messages: 2,
+            inspection_concurrency: 1,
+            max_inspections: 1,
+            ..config()
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let work = tokio::spawn({
+        let p = p.clone();
+        async move {
+            futures::future::join_all((0..6).map(|i| {
+                let p = p.clone();
+                async move {
+                    let subject = if i % 2 == 0 {
+                        format!("stale{}", i / 2)
+                    } else {
+                        format!("fresh{}", i / 2)
+                    };
+                    p.publish(
+                        vec![Publication::new(subject, "1").expected_subject_sequence(0)],
+                        &CancellationToken::new(),
+                    )
+                    .await
+                }
+            }))
+            .await
+        }
+    });
+    g.entered.notified().await;
+    // A single write slot is enough to keep publishing while inspection is blocked.
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        p.publish_priority(
+            vec![Publication::new("independent", "1")],
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.messages, 1);
+    assert_eq!(g.peak.load(SeqCst), 1);
+    g.release.add_permits(6);
+    let results = work.await.unwrap();
+    for (i, result) in results.into_iter().enumerate() {
+        if i % 2 == 0 {
+            assert_eq!(result, Err(Error::Conflict));
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+    assert_eq!(g.peak.load(SeqCst), 1);
+}
+
+#[tokio::test]
+async fn priority_conflict_retry_still_bypasses_admission_policy() {
+    let g = Arc::new(DeniedAdmission {
+        fake: Fake::default(),
+    });
+    g.fake
+        .state
+        .lock()
+        .unwrap()
+        .subjects
+        .insert("stale".into(), 99);
+    let p = AtomicPublisher::new(g.clone(), "TEST", config(), CancellationToken::new()).unwrap();
+    let c = CancellationToken::new();
+    let (a, b) = tokio::join!(
+        p.publish_priority(
+            vec![Publication::new("stale", "1").expected_subject_sequence(0)],
+            &c
+        ),
+        p.publish_priority(
+            vec![Publication::new("fresh", "1").expected_subject_sequence(0)],
+            &c
+        ),
+    );
+    assert_eq!(a, Err(Error::Conflict));
+    assert_eq!(b.unwrap().last_sequence, 1);
+    assert_eq!(g.fake.state.lock().unwrap().calls.len(), 2);
+}
+
+#[tokio::test]
+async fn shutdown_during_policy_wait_is_definite_nonpublication() {
+    let g = admission_gate();
+    let shutdown = CancellationToken::new();
+    let p = AtomicPublisher::new(g.clone(), "TEST", config(), shutdown.clone()).unwrap();
+    let task = tokio::spawn(async move {
+        p.publish(vec![Publication::new("a", "1")], &CancellationToken::new())
+            .await
+    });
+    g.entered.notified().await;
+    shutdown.cancel();
+    assert_eq!(task.await.unwrap(), Err(Error::NotPublished));
+    assert!(g.fake.state.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_during_inspection_prevents_retry() {
+    let g = Arc::new(BlockedInspection {
+        fake: Fake::default(),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        active: Default::default(),
+        peak: Default::default(),
+    });
+    g.fake
+        .state
+        .lock()
+        .unwrap()
+        .subjects
+        .insert("stale".into(), 99);
+    let p = AtomicPublisher::new(g.clone(), "TEST", config(), CancellationToken::new()).unwrap();
+    let c = CancellationToken::new();
+    let task = tokio::spawn({
+        let p = p.clone();
+        let c = c.clone();
+        async move {
+            let keep = CancellationToken::new();
+            tokio::join!(
+                p.publish(
+                    vec![Publication::new("stale", "1").expected_subject_sequence(0)],
+                    &keep
+                ),
+                p.publish(
+                    vec![Publication::new("fresh", "1").expected_subject_sequence(0)],
+                    &c
+                ),
+            )
+        }
+    });
+    g.entered.notified().await;
+    c.cancel();
+    // A cancelled caller can finish without waiting for the inspection reads.
+    tokio::task::yield_now().await;
+    g.release.add_permits(2);
+    let (a, b) = task.await.unwrap();
+    assert_eq!(a, Err(Error::Conflict));
+    assert_eq!(b, Err(Error::NotPublished));
+    assert_eq!(g.fake.state.lock().unwrap().calls.len(), 1);
+    assert!(
+        p.publish(
+            vec![Publication::new("barrier", "1")],
+            &CancellationToken::new()
+        )
+        .await
+        .is_ok()
+    );
+    assert!(!g.fake.state.lock().unwrap().subjects.contains_key("fresh"));
+}
+
+#[tokio::test]
+async fn queued_cancellation_behind_busy_transport_never_publishes() {
+    let g = Arc::new(Gate {
+        calls: Default::default(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let p = AtomicPublisher::new(
+        g.clone(),
+        "TEST",
+        Config {
+            batch_window: Duration::ZERO,
+            ..config()
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let first = tokio::spawn({
+        let p = p.clone();
+        async move {
+            p.publish(
+                vec![Publication::new("first", "1")],
+                &CancellationToken::new(),
+            )
+            .await
+        }
+    });
+    g.entered.notified().await;
+    let c = CancellationToken::new();
+    let pending = p.publish(vec![Publication::new("cancelled", "1")], &c);
+    tokio::pin!(pending);
+    tokio::select! { biased; r=&mut pending => panic!("unexpected completion: {r:?}"), _=tokio::task::yield_now()=>{} }
+    c.cancel();
+    assert_eq!(pending.await, Err(Error::NotPublished));
+    g.release.notify_one();
+    first.await.unwrap().unwrap();
+    p.publish(
+        vec![Publication::new("barrier", "1")],
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*g.calls.lock().unwrap(), ["first", "barrier"]);
 }

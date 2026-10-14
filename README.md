@@ -6,7 +6,7 @@ Submit related messages as one indivisible operation. The publisher can combine 
 
 NATS supplies atomicity. This library supplies the coordination around it.
 
-> Version 0.1.0. Rust 1.88+, Tokio with its time driver enabled, async-nats 0.50. Tested against NATS 2.12.1 and 2.15.0 with atomic publishing enabled. Match client limits to your server configuration. Distributed under MIT OR Apache-2.0.
+> Version 0.2.0. Rust 1.88+, Tokio with its time driver enabled, async-nats 0.50. Tested against NATS 2.12.1 and 2.15.0 with atomic publishing enabled. Match client limits to your server configuration. Distributed under MIT OR Apache-2.0.
 
 ## Why this exists
 
@@ -23,7 +23,7 @@ This is useful for workflow journals, task schedulers, state machines, and other
 - Separate ordinary and priority byte budgets.
 - Conflict isolation with bounded, timed subject-sequence reads.
 - Per-submission first/final stream sequences.
-- Explicit pre-admission versus uncertain-outcome errors.
+- Explicit non-publication versus uncertain-outcome errors, including cancellation of queued writes.
 - Existing async-nats connections: keep your authentication, TLS, and reconnect configuration.
 - An injectable `Backend` for capacity policies, testing, and transport integration.
 
@@ -33,7 +33,7 @@ Install from crates.io:
 
 ```toml
 [dependencies]
-nats-atomic-publisher = "0.1"
+nats-atomic-publisher = "0.2"
 async-nats = "0.50"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -47,6 +47,7 @@ use std::{sync::Arc, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 let client = async_nats::connect("nats://127.0.0.1:4222").await?;
+let inspection_client = async_nats::connect("nats://127.0.0.1:4222").await?;
 let js = async_nats::jetstream::new(client.clone());
 js.create_stream(async_nats::jetstream::stream::Config {
     name: "WORKFLOWS".into(),
@@ -58,7 +59,7 @@ js.create_stream(async_nats::jetstream::stream::Config {
 
 let shutdown = CancellationToken::new();
 let publisher = AtomicPublisher::new(
-    Arc::new(NatsBackend::new(client, Duration::from_secs(3))?),
+    Arc::new(NatsBackend::with_clients(client, inspection_client, Duration::from_secs(3))?),
     "WORKFLOWS",
     Config::default(),
     shutdown.clone(),
@@ -103,11 +104,12 @@ docker rm -f atomic-demo
 | `priority_queue_bytes` | 8 MiB | Independent priority byte allowance |
 | `max_batch_messages` | 1000 | Maximum messages per combined batch |
 | `max_batch_bytes` | 4 MiB | Maximum estimated bytes per batch/submission |
-| `max_in_flight` | 2 | Concurrent write/isolation tasks per publisher |
+| `max_in_flight` | 2 | Concurrent write tasks per publisher |
 | `batch_window` | 1 ms | Maximum collection delay |
 | `request_timeout` | 5 s | Caller deadline and backend-operation deadline |
 | `inspection_timeout` | 1 s | Whole conflict-inspection deadline |
-| `inspection_concurrency` | 16 | Concurrent submission inspections |
+| `inspection_concurrency` | 16 | Concurrent submission inspections within each group |
+| `max_inspections` | 2 | Concurrent conflict-inspection groups, independent of writes |
 
 Byte accounting includes payload, subject, headers, and a conservative per-message allowance. It bounds retained publication estimates; it does not measure allocator overhead or cap callers' own allocations before admission. Configure all publisher instances together against stream/server limits.
 
@@ -115,7 +117,7 @@ Overlapping subject writes are not combined. Global stream-sequence comparisons 
 
 ## Priority and capacity
 
-`publish_priority` uses a separate local queue and byte allowance. It is scheduled ahead of ordinary work when a slot opens, and bypasses `Backend::admit`. Use it for small settlement or recovery records that should remain admissible when ordinary traffic saturates the local queue.
+`publish_priority` uses a separate local queue and byte allowance. Compatible priority submissions share batches under the same collection window and limits as ordinary submissions. It is scheduled ahead of ordinary work when a slot opens, and bypasses `Backend::admit`. Use it for small settlement or recovery records that should remain admissible when ordinary traffic saturates the local queue.
 
 This does **not** reserve server disk, preempt a running batch, or guarantee fairness. Sustained priority traffic can starve ordinary work. A custom backend may enforce an ordinary-write high-water policy while leaving server capacity for completion records. Capacity observations are advisory; the server remains responsible for storage limits.
 
@@ -128,6 +130,7 @@ See [adaptation examples](docs/adapting.md) for policy hooks and integration bou
 | `Invalid` | Invalid input/configuration; never admitted | Fix the input |
 | `Closed` | Publisher closed before admission | Use a live publisher |
 | `NotAdmitted` | Cancelled/timed out before queue admission | Safe to resubmit |
+| `NotPublished` | Queued work abandoned before transmission | Safe to resubmit |
 | `Conflict` | Definite server comparison rejection | Read current state; form a new operation |
 | `Rejected` | Definite server rejection | Resolve capacity/configuration/unsupported operation |
 | `Unavailable` | Setup failed before commit, admission policy failed, or inspection failed | Diagnose and retry according to application policy |
@@ -136,9 +139,21 @@ See [adaptation examples](docs/adapting.md) for policy hooks and integration bou
 
 Only `Conflict` triggers automatic isolation, and only when an actual stale subject comparison is found. Other rejections and uncertain results never trigger automatic replay. Subject-read failures remain `Unavailable`, even if isolation cannot identify a stale comparison.
 
-**Timeout/cancellation after admission is uncertain.** It does not retract a publication. Include stable operation identities in your application records, then read them back to decide whether the intended operation committed. This library does not implement application reconciliation or make an exactly-once claim.
+**Cancellation and deadlines are checked at the transmission boundary.** Before queue admission, cancellation returns `NotAdmitted`. After admission but before transport starts, it returns `NotPublished` and the submission will not be sent. Once transport starts, cancellation returns `Indeterminate`; it cannot retract a publication. Dropping a pending future also abandons work that has not started transmission. A definite conflict allows the remaining candidates to return to the cancellable state before retry. Include stable operation identities in your application records, then read them back to decide whether the intended operation committed. This library does not implement application reconciliation or make an exactly-once claim.
 
-Dropping all publisher handles drains admitted work. Cancelling the shared shutdown token aborts the pump; admitted writes become uncertain. This version has no explicit graceful-shutdown join API: applications needing a drain barrier should await their publication futures before shutdown.
+Dropping all publisher handles drains live admitted work. Cancelling the shared shutdown token aborts the pump; queued writes return `NotPublished`, while writes that started transmission remain uncertain. This version has no explicit graceful-shutdown join API: applications needing a drain barrier should await their publication futures before shutdown.
+
+## Deadlines and independent connections
+
+`publish_until(messages, deadline, cancellation)` and `publish_priority_until` accept an absolute `tokio::time::Instant`, including time waiting for queue and byte capacity. The usual methods use `Config::request_timeout` as the caller deadline. Each backend write attempt is also bounded by `request_timeout`, even if the caller supplies a longer deadline. An expired deadline never permits a new transmission; an in-flight write can still commit after its caller stops waiting.
+
+Use `NatsBackend::with_clients(publication_client, inspection_client, timeout)` with **two independently established connections** for busy workloads. Direct reads sharing a publication connection can delay batch traffic during server-side contention. Both connections must target the same account and stream and have the necessary permissions. Cloning a client shares its socket. `NatsBackend::new` remains available for single-connection use.
+
+Conflict inspection has its own task limit. At most `max_inspections * inspection_concurrency` subject reads are active per publisher. Groups awaiting inspection or retry retain their lane's byte permits, so separating inspection from writes does not create an unbounded memory queue. Subject reads remain timed and never authorize replay of an uncertain write.
+
+### Upgrading from 0.1
+
+Add `NotPublished` to exhaustive error matches and `max_inspections` to exhaustive `Config` literals (or use `..Config::default()`). Callers must not depend on abandoned queued work eventually publishing. Priority operations can now share an atomic batch: a definite non-comparison rejection can affect all members, as it already could on the ordinary lane. No automatic replay follows uncertain outcomes. Alternate-subject and global comparisons retain the conservative exclusive-batch behavior of 0.1.
 
 ## Boundaries
 

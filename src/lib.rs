@@ -65,6 +65,8 @@ pub enum Error {
     Closed,
     #[error("cancelled or timed out before admission; no publication was queued")]
     NotAdmitted,
+    #[error("cancelled or expired before transmission; no publication occurred")]
+    NotPublished,
     #[error("publish outcome is uncertain; reconcile before retrying")]
     Indeterminate,
     #[error("server rejected an optimistic concurrency comparison")]
