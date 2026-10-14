@@ -2,11 +2,11 @@
 
 ## Reuse your connection
 
-Create `async_nats::Client` using your application's existing `ConnectOptions` (TLS, credentials, connection timeout and reconnect policy), then pass it to `NatsBackend::new`. The library does not load credentials or environment files.
+Create `async_nats::Client` using your application's existing `ConnectOptions` (TLS, credentials, connection timeout and reconnect policy), then pass it to `NatsBackend::new`, or establish two connections with those options and pass them to `NatsBackend::with_clients` to separate writes from inspection reads. Both must access the same account and stream; cloning one client does not create another socket. The library does not load credentials or environment files.
 
 ## Add an admission policy
 
-Wrap `NatsBackend` in a type implementing `Backend`. Implement `admit(messages)` to check your account's storage allowance, application quota, or maintenance gate. Delegate `atomic` and `last_subject_sequence` to the inner backend. Use `async_trait` for the implementation and wrap network work in explicit deadlines. Return `Rejected` only for definite admission rejection. Priority submissions bypass `admit` so this hook is not an authorization boundary.
+Wrap `NatsBackend` in a type implementing `Backend`. The admission hook must not publish or perform submission side effects. Implement `admit(messages)` to check your account's storage allowance, application quota, or maintenance gate. Delegate `atomic` and `last_subject_sequence` to the inner backend. Use `async_trait` for the implementation and wrap network work in explicit deadlines. Return `Rejected` only for definite admission rejection. Priority submissions bypass `admit` so this hook is not an authorization boundary.
 
 The publisher bounds each backend write with `request_timeout`, but configure the transport's own request timeouts too. Reading capacity before a write is advisory: concurrent processes can consume capacity after the read.
 

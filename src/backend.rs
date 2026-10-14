@@ -8,7 +8,9 @@ use std::time::Duration;
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
     /// Optional ordinary-write capacity gate. Priority writes bypass this hook.
-    /// It is not a substitute for server-side storage enforcement.
+    /// It is not a substitute for server-side storage enforcement. It must not
+    /// publish or perform submission side effects: cancellation during this hook
+    /// is reported as definite non-publication.
     async fn admit(&self, _messages: &[Publication]) -> Result<(), Error> {
         Ok(())
     }
@@ -25,12 +27,22 @@ pub struct NatsBackend {
 }
 impl NatsBackend {
     pub fn new(client: async_nats::Client, timeout: Duration) -> Result<Self, Error> {
+        Self::with_clients(client.clone(), client, timeout)
+    }
+    /// Use independently connected clients for writes and conflict reads.
+    /// Cloning a client does not create a separate connection. Both clients must
+    /// access the same account and stream, with appropriate permissions.
+    pub fn with_clients(
+        publication_client: async_nats::Client,
+        inspection_client: async_nats::Client,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
         if timeout.is_zero() || tokio::time::Instant::now().checked_add(timeout).is_none() {
             return Err(Error::Invalid);
         }
         Ok(Self {
-            context: async_nats::jetstream::new(client.clone()),
-            client,
+            context: async_nats::jetstream::new(inspection_client),
+            client: publication_client,
             timeout,
         })
     }
